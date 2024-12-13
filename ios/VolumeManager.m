@@ -40,6 +40,12 @@
 @implementation VolumeManager {
   bool hasListeners; CustomVolumeView *customVolumeView;
   AVAudioSession *audioSession;
+  float previousVolume;
+  NSTimer *longPressTimer;
+  NSInteger volumeUpPressCount;
+  NSInteger volumeDownPressCount;
+  CFTimeInterval lastVolumeUpPressTime;
+  CFTimeInterval lastVolumeDownPressTime;
 }
 
 - (void)dealloc {
@@ -50,6 +56,10 @@
   self = [super init];
   if (self) {
     audioSession = [AVAudioSession sharedInstance];
+    volumeUpPressCount = 0;
+    volumeDownPressCount = 0;
+    lastVolumeUpPressTime = 0;
+    lastVolumeDownPressTime = 0;
     [self addVolumeListener];
   }
 
@@ -85,7 +95,7 @@
 }
 
 - (NSArray<NSString *> *)supportedEvents {
-  return @[ @"RNVMEventVolume" ];
+  return @[ @"RNVMEventVolume", @"VolumeKeyEvent" ];
 }
 
 + (BOOL)requiresMainQueueSetup {
@@ -127,6 +137,7 @@ RCT_EXPORT_MODULE(VolumeManager)
                       error:nil];
   [audioSession setActive:YES error:nil];
 
+  previousVolume = audioSession.outputVolume; // Store the initial volume
   [audioSession
       addObserver:self
        forKeyPath:@"outputVolume"
@@ -145,14 +156,128 @@ RCT_EXPORT_MODULE(VolumeManager)
   if (object == [AVAudioSession sharedInstance] &&
       [keyPath isEqualToString:@"outputVolume"]) {
     float newValue = [change[@"new"] floatValue];
+    float newVolume = newValue;
+    float oldVolume = [change[@"old"] floatValue];
+    previousVolume = newVolume;
     if (hasListeners) {
       [self
           sendEventWithName:@"RNVMEventVolume"
                        body:@{@"volume" : [NSNumber numberWithFloat:newValue]}];
+      if(newVolume > 0.99){
+        newVolume = 0.5;
+        oldVolume = 0.4;
+          [self resetVolumeTo:newVolume];
+      }
+      if(newVolume < 0.01){
+        newVolume = 0.5;
+        oldVolume = 0.6;
+          [self resetVolumeTo:newVolume];
+      }
+      if (newVolume > oldVolume) {
+          [self handleVolumeKeyPress:@"up"];
+      } else if (newVolume < oldVolume) {
+          [self handleVolumeKeyPress:@"down"];
+      }
     }
   }
 }
+- (void)resetVolumeTo:(float)value {
+  __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      __strong typeof(weakSelf) strongSelf = weakSelf;
+      if(strongSelf){
+        strongSelf->customVolumeView.volumeSlider.value = value;
+        AVAudioSession *audioSession = [AVAudioSession sharedInstance];
+        [audioSession setActive:YES error:nil];
+      }
+    });
+}
+- (void)handleVolumeKeyPress:(NSString *)direction {
+    CFTimeInterval currentTime = CACurrentMediaTime();
+    NSLog(@"direction: %@ ", direction);
+    if ([direction isEqualToString:@"up"]) {
+        if (currentTime - lastVolumeUpPressTime < 0.4) {
+            volumeUpPressCount++;
+        } else {
+            volumeUpPressCount = 1; // Reset counter for single press
+        }
+        NSLog(@"UP EVENT: %2f, %d", (currentTime-lastVolumeUpPressTime), volumeUpPressCount);
+        lastVolumeUpPressTime = currentTime;
+    } else if ([direction isEqualToString:@"down"]) {
+        if (currentTime - lastVolumeDownPressTime < 0.4) {
+            volumeDownPressCount++;
+        } else {
+            volumeDownPressCount = 1; // Reset counter for single press
+        }
+        lastVolumeDownPressTime = currentTime;
+    }
+    [self startEventDetectionTimerForDirection:direction];
+    if(volumeUpPressCount >= 4 || volumeDownPressCount >= 4)
+    [self startLongPressTimerForDirection:direction];
+}
+- (void)startEventDetectionTimerForDirection:(NSString *)direction {
+    [longPressTimer invalidate]; // Cancel any existing timer
 
+    longPressTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
+                                                      repeats:NO
+                                                        block:^(NSTimer * _Nonnull timer) {
+        [self finalizeEventForDirection:direction];
+    }];
+}
+- (void)finalizeEventForDirection:(NSString *)direction {
+    NSInteger count = [direction isEqualToString:@"up"] ? volumeUpPressCount : volumeDownPressCount;
+    NSString *eventType = nil;
+    switch (count) {
+        case 1:
+            eventType = [direction isEqualToString:@"up"] ? @"volumeUpSingle" : @"volumeDownSingle";
+            break;
+        case 2:
+            eventType = [direction isEqualToString:@"up"] ? @"volumeUpDouble" : @"volumeDownDouble";
+            break;
+        case 3:
+            eventType = [direction isEqualToString:@"up"] ? @"volumeUpTriple" : @"volumeDownTriple";
+            break;
+        default:
+            break;
+    }
+    NSLog(@"Normal Key Press Emitting event: %@ - %@", direction, eventType);
+    if (eventType && hasListeners) {
+        [self sendEventWithName:@"VolumeKeyEvent"
+                           body:eventType];
+    }
+    if ([direction isEqualToString:@"up"]) {
+        volumeUpPressCount = 0;
+    } else if ([direction isEqualToString:@"down"]) {
+        volumeDownPressCount = 0;
+    }
+}
+- (void)startLongPressTimerForDirection:(NSString *)direction {
+    [longPressTimer invalidate]; // Cancel any existing timer
+    longPressTimer = [NSTimer scheduledTimerWithTimeInterval:0.8
+                                                           repeats:NO
+                                                             block:^(NSTimer * _Nonnull timer) {
+        [self handleLongPressForDirection:direction];
+    }];
+}
+- (void)handleLongPressForDirection:(NSString *)direction {
+    [longPressTimer invalidate]; // Cancel the timer
+    NSString *eventType = nil;
+    if ([direction isEqualToString:@"up"]) {
+        eventType = @"volumeUpHold";
+    } else if ([direction isEqualToString:@"down"]) {
+        eventType = @"volumeDownHold";
+    }
+    NSLog(@"Emitting long press event: %@ - %d", direction, @(hasListeners));
+    if (hasListeners) {
+        [self sendEventWithName:@"VolumeKeyEvent"
+                           body:eventType];
+    }
+    if ([direction isEqualToString:@"up"]) {
+        volumeUpPressCount = 0;
+    } else if ([direction isEqualToString:@"down"]) {
+        volumeDownPressCount = 0;
+    }
+}
 RCT_EXPORT_METHOD(showNativeVolumeUI : (NSDictionary *)showNativeVolumeUI) {
   __weak typeof(self) weakSelf = self;
   dispatch_async(dispatch_get_main_queue(), ^{
