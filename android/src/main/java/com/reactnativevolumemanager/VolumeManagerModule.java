@@ -388,7 +388,6 @@ public class VolumeManagerModule
           rootView.setFocusableInTouchMode(true);
           rootView.requestFocus();
 
-          if (hardwareButtonListenerRegistered) return;
           rootView.setOnKeyListener((v, keyCode, event) -> {
               long currentTime = System.currentTimeMillis();
               if (event.getAction() == KeyEvent.ACTION_DOWN) {
