@@ -2,6 +2,8 @@ package com.reactnativevolumemanager;
 
 import static com.facebook.react.bridge.UiThreadUtil.runOnUiThread;
 
+import android.os.Handler;
+import android.os.Looper;
 import android.app.Activity;
 import android.app.NotificationManager;
 import android.content.BroadcastReceiver;
@@ -47,7 +49,17 @@ public class VolumeManagerModule
   private final VolumeBroadcastReceiver volumeBR;
 
   private Boolean showNativeVolumeUI = true;
+  private Boolean useDeviceEmitter = false;
   private Boolean hardwareButtonListenerRegistered = false;
+  private int volumeUpPressCount = 0;
+  private int volumeDownPressCount = 0;
+  private long lastVolumeUpPressTime = 0;
+  private long lastVolumeDownPressTime = 0;
+  private final long doubleClickThreshold = 300; // Milliseconds for double/triple detection
+  private final long holdThreshold = 800; // Milliseconds for hold detection
+  private boolean isVolumeUpHeld = false;
+  private boolean isVolumeDownHeld = false;
+  private Handler handler = new Handler(Looper.getMainLooper());
 
   String category;
 
@@ -122,7 +134,11 @@ public class VolumeManagerModule
   @ReactMethod
   public void showNativeVolumeUI(ReadableMap config) {
     showNativeVolumeUI = config.getBoolean("enabled");
+    useDeviceEmitter = config.getBoolean("deviceEmitter");
     // we want to listen to the hardware volume key buttons
+    if (useDeviceEmitter)
+      setupCustomKeyListener();
+    else
     setupKeyListener();
   }
 
@@ -354,8 +370,7 @@ public class VolumeManagerModule
         para.putDouble(VOL_ALARM, getNormalizationVolume(VOL_ALARM));
         para.putDouble(
           VOL_NOTIFICATION,
-          getNormalizationVolume(VOL_NOTIFICATION)
-        );
+            getNormalizationVolume(VOL_NOTIFICATION));
         try {
           mContext
             .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
@@ -366,5 +381,125 @@ public class VolumeManagerModule
         }
       }
     }
+  }
+  private void setupCustomKeyListener() {
+      runOnUiThread(() -> {
+          View rootView = ((ViewGroup) mContext.getCurrentActivity().getWindow().getDecorView());
+          rootView.setFocusableInTouchMode(true);
+          rootView.requestFocus();
+
+          rootView.setOnKeyListener((v, keyCode, event) -> {
+              long currentTime = System.currentTimeMillis();
+              if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                  switch (keyCode) {
+              case KeyEvent.KEYCODE_VOLUME_UP:
+              am.adjustStreamVolume(
+                AudioManager.STREAM_MUSIC,
+                AudioManager.ADJUST_RAISE,
+                AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE
+              );
+                if (!isVolumeUpHeld) {
+                  if (currentTime - lastVolumeUpPressTime < doubleClickThreshold) {
+                    volumeUpPressCount++;
+                  } else {
+                    volumeUpPressCount = 1;
+                  }
+                  lastVolumeUpPressTime = currentTime;
+                  isVolumeUpHeld = true;
+                  handler.postDelayed(() -> {
+                    if (isVolumeUpHeld) {
+                      sendEventToJS("volumeUpHold");
+                      isVolumeUpHeld = false;
+                    }
+                  }, holdThreshold);
+                }
+                          return true;
+                      case KeyEvent.KEYCODE_VOLUME_DOWN:
+                                am.adjustStreamVolume(
+                                  AudioManager.STREAM_MUSIC,
+                                  AudioManager.ADJUST_RAISE,
+                                  AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE
+                                );
+                if (!isVolumeDownHeld) {
+                  if (currentTime - lastVolumeDownPressTime < doubleClickThreshold) {
+                    volumeDownPressCount++;
+                  } else {
+                    volumeDownPressCount = 1;
+                  }
+                  lastVolumeDownPressTime = currentTime;
+                  isVolumeDownHeld = true;
+                  handler.postDelayed(() -> {
+                    if (isVolumeDownHeld) {
+                      sendEventToJS("volumeDownHold");
+                      isVolumeDownHeld = false;
+                    }
+                  }, holdThreshold);
+                }
+                          return true;
+                  }
+          } else if (event.getAction() == KeyEvent.ACTION_UP) {
+                  am.adjustStreamVolume(
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.ADJUST_RAISE,
+                    AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE
+                  );
+                  switch (keyCode) {
+                      case KeyEvent.KEYCODE_VOLUME_UP:
+                          if (isVolumeUpHeld) {
+                              isVolumeUpHeld = false;
+                              handler.removeCallbacksAndMessages(null);
+                          }
+                          handler.postDelayed(() -> {
+                              switch (volumeUpPressCount) {
+                                  case 1:
+                                      sendEventToJS("volumeUpSingle");
+                                      break;
+                                  case 2:
+                                      sendEventToJS("volumeUpDouble");
+                                      break;
+                                  case 3:
+                                      sendEventToJS("volumeUpTriple");
+                                      break;
+                              }
+                              volumeUpPressCount = 0;
+                }, doubleClickThreshold);
+                          return true;
+                      case KeyEvent.KEYCODE_VOLUME_DOWN:
+                          am.adjustStreamVolume(
+                            AudioManager.STREAM_MUSIC,
+                            AudioManager.ADJUST_RAISE,
+                            AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE
+                          );
+                          if (isVolumeDownHeld) {
+                              isVolumeDownHeld = false;
+                              handler.removeCallbacksAndMessages(null);
+                          }
+                          handler.postDelayed(() -> {
+                              switch (volumeDownPressCount) {
+                                  case 1:
+                                      sendEventToJS("volumeDownSingle");
+                                      break;
+                                  case 2:
+                                      sendEventToJS("volumeDownDouble");
+                                      break;
+                                  case 3:
+                                      sendEventToJS("volumeDownTriple");
+                                      break;
+                              }
+                              volumeDownPressCount = 0;
+                }, doubleClickThreshold);
+                          return true;
+                  }
+              }
+              return false;
+          });
+      });
+  }
+  private void sendEventToJS(String eventName) {
+      if (mContext.hasActiveCatalystInstance()) {
+          mContext
+              .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+              .emit("VolumeKeyEvent", eventName);
+      }
   }
 }
