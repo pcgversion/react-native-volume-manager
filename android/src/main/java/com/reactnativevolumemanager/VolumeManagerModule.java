@@ -55,8 +55,8 @@ public class VolumeManagerModule
   private int volumeDownPressCount = 0;
   private long lastVolumeUpPressTime = 0;
   private long lastVolumeDownPressTime = 0;
-  private final long doubleClickThreshold = 300; // Milliseconds for double/triple detection
-  private final long holdThreshold = 800; // Milliseconds for hold detection
+  private final long doubleClickThreshold = 200; // Milliseconds for double/triple detection
+  private final long holdThreshold = 400; // Milliseconds for hold detection
   private boolean isVolumeUpHeld = false;
   private boolean isVolumeDownHeld = false;
   private Handler handler = new Handler(Looper.getMainLooper());
