@@ -28,6 +28,17 @@ import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.module.annotations.ReactModule;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
+import android.view.Window;
+import android.view.MotionEvent;
+import android.view.accessibility.AccessibilityEvent;
+import android.view.Menu;
+import android.view.MenuItem;
+import android.view.WindowManager;
+import android.view.ActionMode;
+import android.view.SearchEvent;
+import android.view.KeyboardShortcutGroup;
+import android.annotation.TargetApi;
+import android.content.ContextWrapper;
 
 @ReactModule(name = VolumeManagerModule.NAME)
 public class VolumeManagerModule
@@ -35,6 +46,8 @@ public class VolumeManagerModule
   implements ActivityEventListener, LifecycleEventListener {
 
   public static final String NAME = "VolumeManager";
+  public static volatile boolean suppressVolumeUI = false;
+  public static volatile VolumeManagerModule instance = null;
   private final String TAG = VolumeManagerModule.class.getSimpleName();
 
   private static final String VOL_VOICE_CALL = "call";
@@ -55,11 +68,15 @@ public class VolumeManagerModule
   private int volumeDownPressCount = 0;
   private long lastVolumeUpPressTime = 0;
   private long lastVolumeDownPressTime = 0;
-  private final long doubleClickThreshold = 200; // Milliseconds for double/triple detection
+  private final long doubleClickThreshold = 350; // Milliseconds for double/triple detection
   private final long holdThreshold = 400; // Milliseconds for hold detection
   private boolean isVolumeUpHeld = false;
   private boolean isVolumeDownHeld = false;
   private Handler handler = new Handler(Looper.getMainLooper());
+  private Runnable volumeUpHoldRunnable = null;
+  private Runnable volumeDownHoldRunnable = null;
+  private Runnable volumeUpTapRunnable = null;
+  private Runnable volumeDownTapRunnable = null;
 
   String category;
 
@@ -73,6 +90,8 @@ public class VolumeManagerModule
         .getSystemService(Context.AUDIO_SERVICE);
     volumeBR = new VolumeBroadcastReceiver();
     this.category = null;
+    suppressVolumeUI = !showNativeVolumeUI;
+    instance = this;
   }
 
   private void registerVolumeReceiver() {
@@ -97,49 +116,26 @@ public class VolumeManagerModule
   }
 
   private void setupKeyListener() {
-    runOnUiThread(() -> {
-      View rootView =
-        ((ViewGroup) mContext.getCurrentActivity().getWindow().getDecorView());
-      rootView.setFocusableInTouchMode(true);
-      rootView.requestFocus();
-
-      if (hardwareButtonListenerRegistered) return;
-
-      rootView.setOnKeyListener((v, keyCode, event) -> {
-        hardwareButtonListenerRegistered = true;
-        if (showNativeVolumeUI) return false;
-
-        switch (event.getKeyCode()) {
-          case KeyEvent.KEYCODE_VOLUME_UP:
-            am.adjustStreamVolume(
-              AudioManager.STREAM_MUSIC,
-              AudioManager.ADJUST_RAISE,
-              AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE
-            );
-            return true;
-          case KeyEvent.KEYCODE_VOLUME_DOWN:
-            am.adjustStreamVolume(
-              AudioManager.STREAM_MUSIC,
-              AudioManager.ADJUST_LOWER,
-              AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE
-            );
-            return true;
-          default:
-            return false;
-        }
-      });
-    });
+    syncWindowCallbacks(mContext.getCurrentActivity());
   }
+
+  
 
   @ReactMethod
   public void showNativeVolumeUI(ReadableMap config) {
     showNativeVolumeUI = config.getBoolean("enabled");
     useDeviceEmitter = config.getBoolean("deviceEmitter");
+    suppressVolumeUI = !showNativeVolumeUI;
     // we want to listen to the hardware volume key buttons
-    if (useDeviceEmitter)
+    if (useDeviceEmitter) {
       setupCustomKeyListener();
-    else
-    setupKeyListener();
+    } else {
+      if (showNativeVolumeUI) {
+        cleanupKeyListener();
+      } else {
+        setupKeyListener();
+      }
+    }
   }
 
   @Override
@@ -307,13 +303,7 @@ public class VolumeManagerModule
   }
 
   private void cleanupKeyListener() {
-    runOnUiThread(() -> {
-      if (!hardwareButtonListenerRegistered) return;
-      View rootView =
-        ((ViewGroup) mContext.getCurrentActivity().getWindow().getDecorView());
-      rootView.setOnKeyListener(null);
-      hardwareButtonListenerRegistered = false;
-    });
+    syncWindowCallbacks(mContext.getCurrentActivity());
   }
 
   @Override
@@ -331,7 +321,14 @@ public class VolumeManagerModule
 
   @Override
   public void onHostResume() {
-    setupKeyListener();
+    Log.d(TAG, "Host resumed - registering volume receiver and restoring key listener state: ");
+    if (useDeviceEmitter) {
+      setupCustomKeyListener();
+    } else if (!showNativeVolumeUI) {
+      setupKeyListener();
+    } else {
+      cleanupKeyListener();
+    }
     registerVolumeReceiver();
   }
 
@@ -344,6 +341,7 @@ public class VolumeManagerModule
   @Override
   public void onHostDestroy() {
     cleanupKeyListener(); // Release the key listener when the root view is destroyed
+    instance = null;
   }
 
   private class VolumeBroadcastReceiver extends BroadcastReceiver {
@@ -383,117 +381,381 @@ public class VolumeManagerModule
     }
   }
   private void setupCustomKeyListener() {
-      runOnUiThread(() -> {
-          View rootView = ((ViewGroup) mContext.getCurrentActivity().getWindow().getDecorView());
-          rootView.setFocusableInTouchMode(true);
-          rootView.requestFocus();
+    syncWindowCallbacks(mContext.getCurrentActivity());
+  }
 
-          rootView.setOnKeyListener((v, keyCode, event) -> {
-              long currentTime = System.currentTimeMillis();
-              if (event.getAction() == KeyEvent.ACTION_DOWN) {
-                  switch (keyCode) {
+  private boolean handleCustomKeyEvent(int keyCode, KeyEvent event) {
+      long currentTime = System.currentTimeMillis();
+      int flags = showNativeVolumeUI ? AudioManager.FLAG_SHOW_UI : 0;
+      
+      if (event.getAction() == KeyEvent.ACTION_DOWN) {
+          if (event.getRepeatCount() == 0) {
+              switch (keyCode) {
+                  case KeyEvent.KEYCODE_VOLUME_UP:
+                      am.adjustStreamVolume(
+                        AudioManager.STREAM_MUSIC,
+                        AudioManager.ADJUST_RAISE,
+                        flags
+                      );
+                      
+                      if (!isVolumeUpHeld) {
+                          if (currentTime - lastVolumeUpPressTime < doubleClickThreshold) {
+                              volumeUpPressCount++;
+                          } else {
+                              volumeUpPressCount = 1;
+                          }
+                          lastVolumeUpPressTime = currentTime;
+                          isVolumeUpHeld = true;
+                          
+                          if (volumeUpHoldRunnable != null) {
+                              handler.removeCallbacks(volumeUpHoldRunnable);
+                          }
+                          volumeUpHoldRunnable = new Runnable() {
+                              @Override
+                              public void run() {
+                                  if (isVolumeUpHeld) {
+                                      sendEventToJS("volumeUpHold");
+                                      isVolumeUpHeld = false;
+                                      volumeUpPressCount = 0;
+                                  }
+                                  volumeUpHoldRunnable = null;
+                              }
+                          };
+                          handler.postDelayed(volumeUpHoldRunnable, holdThreshold);
+                      }
+                      break;
+                      
+                  case KeyEvent.KEYCODE_VOLUME_DOWN:
+                      am.adjustStreamVolume(
+                        AudioManager.STREAM_MUSIC,
+                        AudioManager.ADJUST_LOWER,
+                        flags
+                      );
+                      
+                      if (!isVolumeDownHeld) {
+                          if (currentTime - lastVolumeDownPressTime < doubleClickThreshold) {
+                              volumeDownPressCount++;
+                          } else {
+                              volumeDownPressCount = 1;
+                          }
+                          lastVolumeDownPressTime = currentTime;
+                          isVolumeDownHeld = true;
+                          
+                          if (volumeDownHoldRunnable != null) {
+                              handler.removeCallbacks(volumeDownHoldRunnable);
+                          }
+                          volumeDownHoldRunnable = new Runnable() {
+                              @Override
+                              public void run() {
+                                  if (isVolumeDownHeld) {
+                                      sendEventToJS("volumeDownHold");
+                                      isVolumeDownHeld = false;
+                                      volumeDownPressCount = 0;
+                                  }
+                                  volumeDownHoldRunnable = null;
+                              }
+                          };
+                          handler.postDelayed(volumeDownHoldRunnable, holdThreshold);
+                      }
+                      break;
+              }
+          }
+          return keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN;
+      } else if (event.getAction() == KeyEvent.ACTION_UP) {
+          switch (keyCode) {
               case KeyEvent.KEYCODE_VOLUME_UP:
-              am.adjustStreamVolume(
-                AudioManager.STREAM_MUSIC,
-                AudioManager.ADJUST_RAISE,
-                AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE
-              );
-                if (!isVolumeUpHeld) {
-                  if (currentTime - lastVolumeUpPressTime < doubleClickThreshold) {
-                    volumeUpPressCount++;
-                  } else {
-                    volumeUpPressCount = 1;
-                  }
-                  lastVolumeUpPressTime = currentTime;
-                  isVolumeUpHeld = true;
-                  handler.postDelayed(() -> {
-                    if (isVolumeUpHeld) {
-                      sendEventToJS("volumeUpHold");
+                  if (isVolumeUpHeld) {
                       isVolumeUpHeld = false;
-                    }
-                  }, holdThreshold);
-                }
-                          return true;
-                      case KeyEvent.KEYCODE_VOLUME_DOWN:
-                                am.adjustStreamVolume(
-                                  AudioManager.STREAM_MUSIC,
-                                  AudioManager.ADJUST_RAISE,
-                                  AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE
-                                );
-                if (!isVolumeDownHeld) {
-                  if (currentTime - lastVolumeDownPressTime < doubleClickThreshold) {
-                    volumeDownPressCount++;
-                  } else {
-                    volumeDownPressCount = 1;
+                      if (volumeUpHoldRunnable != null) {
+                          handler.removeCallbacks(volumeUpHoldRunnable);
+                          volumeUpHoldRunnable = null;
+                      }
                   }
-                  lastVolumeDownPressTime = currentTime;
-                  isVolumeDownHeld = true;
-                  handler.postDelayed(() -> {
-                    if (isVolumeDownHeld) {
-                      sendEventToJS("volumeDownHold");
+                  if (volumeUpTapRunnable != null) {
+                      handler.removeCallbacks(volumeUpTapRunnable);
+                  }
+                  volumeUpTapRunnable = new Runnable() {
+                      @Override
+                      public void run() {
+                          switch (volumeUpPressCount) {
+                              case 1:
+                                  sendEventToJS("volumeUpSingle");
+                                  break;
+                              case 2:
+                                  sendEventToJS("volumeUpDouble");
+                                  break;
+                              case 3:
+                                  sendEventToJS("volumeUpTriple");
+                                  break;
+                          }
+                          volumeUpPressCount = 0;
+                          volumeUpTapRunnable = null;
+                      }
+                  };
+                  handler.postDelayed(volumeUpTapRunnable, doubleClickThreshold);
+                  return true;
+                  
+              case KeyEvent.KEYCODE_VOLUME_DOWN:
+                  if (isVolumeDownHeld) {
                       isVolumeDownHeld = false;
-                    }
-                  }, holdThreshold);
-                }
-                          return true;
+                      if (volumeDownHoldRunnable != null) {
+                          handler.removeCallbacks(volumeDownHoldRunnable);
+                          volumeDownHoldRunnable = null;
+                      }
                   }
-          } else if (event.getAction() == KeyEvent.ACTION_UP) {
-                  am.adjustStreamVolume(
-                    AudioManager.STREAM_MUSIC,
-                    AudioManager.ADJUST_RAISE,
-                    AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE
-                  );
-                  switch (keyCode) {
-                      case KeyEvent.KEYCODE_VOLUME_UP:
-                          if (isVolumeUpHeld) {
-                              isVolumeUpHeld = false;
-                              handler.removeCallbacksAndMessages(null);
+                  if (volumeDownTapRunnable != null) {
+                      handler.removeCallbacks(volumeDownTapRunnable);
+                  }
+                  volumeDownTapRunnable = new Runnable() {
+                      @Override
+                      public void run() {
+                          switch (volumeDownPressCount) {
+                              case 1:
+                                  sendEventToJS("volumeDownSingle");
+                                  break;
+                              case 2:
+                                  sendEventToJS("volumeDownDouble");
+                                  break;
+                              case 3:
+                                  sendEventToJS("volumeDownTriple");
+                                  break;
                           }
-                          handler.postDelayed(() -> {
-                              switch (volumeUpPressCount) {
-                                  case 1:
-                                      sendEventToJS("volumeUpSingle");
-                                      break;
-                                  case 2:
-                                      sendEventToJS("volumeUpDouble");
-                                      break;
-                                  case 3:
-                                      sendEventToJS("volumeUpTriple");
-                                      break;
-                              }
-                              volumeUpPressCount = 0;
-                }, doubleClickThreshold);
-                          return true;
-                      case KeyEvent.KEYCODE_VOLUME_DOWN:
-                          am.adjustStreamVolume(
-                            AudioManager.STREAM_MUSIC,
-                            AudioManager.ADJUST_RAISE,
-                            AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE
-                          );
-                          if (isVolumeDownHeld) {
-                              isVolumeDownHeld = false;
-                              handler.removeCallbacksAndMessages(null);
+                          volumeDownPressCount = 0;
+                          volumeDownTapRunnable = null;
+                      }
+                  };
+                  handler.postDelayed(volumeDownTapRunnable, doubleClickThreshold);
+                  return true;
+          }
+      }
+      return false;
+  }
+
+  private Window getWindowFromRootView(View view) {
+      try {
+          java.lang.reflect.Field windowField = null;
+          Class<?> currentClass = view.getClass();
+          while (currentClass != null) {
+              try {
+                  windowField = currentClass.getDeclaredField("mWindow");
+                  break;
+              } catch (NoSuchFieldException e) {
+                  currentClass = currentClass.getSuperclass();
+              }
+          }
+          if (windowField != null) {
+              windowField.setAccessible(true);
+              return (Window) windowField.get(view);
+          }
+      } catch (Exception e) {
+          Log.e(TAG, "Error getting window from view reflection", e);
+      }
+      
+      // Fallback
+      Context context = view.getContext();
+      while (context instanceof ContextWrapper) {
+          if (context instanceof Activity) {
+              return ((Activity) context).getWindow();
+          }
+          context = ((ContextWrapper) context).getBaseContext();
+      }
+      return null;
+  }
+
+  public void syncWindowCallbacks(Activity activity) {
+      if (activity == null) return;
+      runOnUiThread(() -> {
+          try {
+              Class<?> wmgClass = Class.forName("android.view.WindowManagerGlobal");
+              Object wmgInstance = wmgClass.getMethod("getInstance").invoke(null);
+              java.lang.reflect.Field mViewsField = wmgClass.getDeclaredField("mViews");
+              mViewsField.setAccessible(true);
+              java.util.List<View> views = (java.util.List<View>) mViewsField.get(wmgInstance);
+              
+              if (views != null) {
+                  for (View view : views) {
+                      Window window = getWindowFromRootView(view);
+                      if (window != null) {
+                          Window.Callback currentCallback = window.getCallback();
+                          if (currentCallback != null && !(currentCallback instanceof WindowCallbackWrapper)) {
+                              window.setCallback(new WindowCallbackWrapper(currentCallback, this));
                           }
-                          handler.postDelayed(() -> {
-                              switch (volumeDownPressCount) {
-                                  case 1:
-                                      sendEventToJS("volumeDownSingle");
-                                      break;
-                                  case 2:
-                                      sendEventToJS("volumeDownDouble");
-                                      break;
-                                  case 3:
-                                      sendEventToJS("volumeDownTriple");
-                                      break;
-                              }
-                              volumeDownPressCount = 0;
-                }, doubleClickThreshold);
-                          return true;
+                      }
                   }
               }
-              return false;
-          });
+          } catch (Exception e) {
+              Log.e(TAG, "Error syncing window callbacks", e);
+          }
       });
+  }
+
+  public boolean handleKeyEvent(int keyCode, KeyEvent event) {
+      if (!suppressVolumeUI) {
+          return false;
+      }
+      if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+          if (useDeviceEmitter) {
+              return handleCustomKeyEvent(keyCode, event);
+          } else {
+              if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                  int direction = keyCode == KeyEvent.KEYCODE_VOLUME_UP
+                      ? AudioManager.ADJUST_RAISE
+                      : AudioManager.ADJUST_LOWER;
+                  am.adjustStreamVolume(AudioManager.STREAM_MUSIC, direction, 0);
+              }
+              return true; // Consumed to hide native UI!
+          }
+      }
+      return false;
+  }
+
+  public static void syncCallbacks(Activity activity) {
+      VolumeManagerModule activeInstance = instance;
+      if (activeInstance != null) {
+          activeInstance.syncWindowCallbacks(activity);
+      }
+  }
+
+  private static class WindowCallbackWrapper implements Window.Callback {
+      private final Window.Callback mWrapped;
+      private final VolumeManagerModule mModule;
+
+      public WindowCallbackWrapper(Window.Callback wrapped, VolumeManagerModule module) {
+          mWrapped = wrapped;
+          mModule = module;
+      }
+
+      @Override
+      public boolean dispatchKeyEvent(KeyEvent event) {
+          if (mModule.handleKeyEvent(event.getKeyCode(), event)) {
+              return true; // Consumed!
+          }
+          return mWrapped.dispatchKeyEvent(event);
+      }
+
+      @Override
+      public boolean dispatchKeyShortcutEvent(KeyEvent event) {
+          return mWrapped.dispatchKeyShortcutEvent(event);
+      }
+
+      @Override
+      public boolean dispatchTouchEvent(MotionEvent event) {
+          return mWrapped.dispatchTouchEvent(event);
+      }
+
+      @Override
+      public boolean dispatchTrackballEvent(MotionEvent event) {
+          return mWrapped.dispatchTrackballEvent(event);
+      }
+
+      @Override
+      public boolean dispatchGenericMotionEvent(MotionEvent event) {
+          return mWrapped.dispatchGenericMotionEvent(event);
+      }
+
+      @Override
+      public boolean dispatchPopulateAccessibilityEvent(AccessibilityEvent event) {
+          return mWrapped.dispatchPopulateAccessibilityEvent(event);
+      }
+
+      @Override
+      public View onCreatePanelView(int featureId) {
+          return mWrapped.onCreatePanelView(featureId);
+      }
+
+      @Override
+      public boolean onCreatePanelMenu(int featureId, Menu menu) {
+          return mWrapped.onCreatePanelMenu(featureId, menu);
+      }
+
+      @Override
+      public boolean onPreparePanel(int featureId, View view, Menu menu) {
+          return mWrapped.onPreparePanel(featureId, view, menu);
+      }
+
+      @Override
+      public boolean onMenuOpened(int featureId, Menu menu) {
+          return mWrapped.onMenuOpened(featureId, menu);
+      }
+
+      @Override
+      public boolean onMenuItemSelected(int featureId, MenuItem item) {
+          return mWrapped.onMenuItemSelected(featureId, item);
+      }
+
+      @Override
+      public void onWindowAttributesChanged(WindowManager.LayoutParams attrs) {
+          mWrapped.onWindowAttributesChanged(attrs);
+      }
+
+      @Override
+      public void onContentChanged() {
+          mWrapped.onContentChanged();
+      }
+
+      @Override
+      public void onWindowFocusChanged(boolean hasFocus) {
+          mWrapped.onWindowFocusChanged(hasFocus);
+      }
+
+      @Override
+      public void onAttachedToWindow() {
+          mWrapped.onAttachedToWindow();
+      }
+
+      @Override
+      public void onDetachedFromWindow() {
+          mWrapped.onDetachedFromWindow();
+      }
+
+      @Override
+      public void onPanelClosed(int featureId, Menu menu) {
+          mWrapped.onPanelClosed(featureId, menu);
+      }
+
+      @Override
+      public boolean onSearchRequested() {
+          return mWrapped.onSearchRequested();
+      }
+
+      @TargetApi(Build.VERSION_CODES.M)
+      @Override
+      public boolean onSearchRequested(SearchEvent searchEvent) {
+          return mWrapped.onSearchRequested(searchEvent);
+      }
+
+      @Override
+      public ActionMode onWindowStartingActionMode(ActionMode.Callback callback) {
+          return mWrapped.onWindowStartingActionMode(callback);
+      }
+
+      @TargetApi(Build.VERSION_CODES.M)
+      @Override
+      public ActionMode onWindowStartingActionMode(ActionMode.Callback callback, int type) {
+          return mWrapped.onWindowStartingActionMode(callback, type);
+      }
+
+      @Override
+      public void onActionModeStarted(ActionMode mode) {
+          mWrapped.onActionModeStarted(mode);
+      }
+
+      @Override
+      public void onActionModeFinished(ActionMode mode) {
+          mWrapped.onActionModeFinished(mode);
+      }
+
+      @TargetApi(Build.VERSION_CODES.N)
+      @Override
+      public void onProvideKeyboardShortcuts(java.util.List<KeyboardShortcutGroup> data, Menu menu, int deviceId) {
+          mWrapped.onProvideKeyboardShortcuts(data, menu, deviceId);
+      }
+
+      @TargetApi(Build.VERSION_CODES.O)
+      @Override
+      public void onPointerCaptureChanged(boolean hasCapture) {
+          mWrapped.onPointerCaptureChanged(hasCapture);
+      }
   }
   private void sendEventToJS(String eventName) {
       if (mContext.hasActiveCatalystInstance()) {
